@@ -1,19 +1,40 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for GraphDef resource lifetime management and RAII correctness."""
+"""Tests for GraphDefinition resource lifetime management and RAII correctness."""
 
+import ctypes
 import gc
+import time
+import weakref
 
 import pytest
 from helpers.graph_kernels import compile_common_kernels
 from helpers.misc import try_create_condition
 
-from cuda.core import Device, EventOptions, Kernel, LaunchConfig
+
+def _wait_until(predicate, timeout=2.0, interval=0.01):
+    """Poll predicate() until True or timeout, driving gc each iteration.
+
+    Used for assertions about resource cleanup that may be delayed by CUDA's
+    asynchronous user-object destructor pump (DPC) or, on free-threaded
+    Python, by deferred reference-count processing. A bounded poll keeps the
+    test correct without depending on undocumented driver timing guarantees.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        gc.collect()
+        if predicate():
+            return
+        time.sleep(interval)
+    raise AssertionError(f"condition not satisfied within {timeout}s")
+
+
+from cuda.core import Device, DeviceMemoryResource, EventOptions, Kernel, LaunchConfig
 from cuda.core.graph import (
     ChildGraphNode,
     ConditionalNode,
-    GraphDef,
+    GraphDefinition,
     KernelNode,
 )
 
@@ -29,7 +50,7 @@ def _skip_if_no_mempool():
 
 
 def _make_if(g, cond):
-    node = g.if_cond(cond)
+    node = g.if_then(cond)
     return [node.then]
 
 
@@ -58,8 +79,8 @@ _COND_BUILDERS = [
 
 @pytest.mark.parametrize("builder, expected_count", _COND_BUILDERS)
 def test_branches_survive_parent_deletion(init_cuda, builder, expected_count):
-    """All branch graphs remain valid after parent GraphDef is deleted."""
-    g = GraphDef()
+    """All branch graphs remain valid after parent GraphDefinition is deleted."""
+    g = GraphDefinition()
     condition = try_create_condition(g)
     branches = builder(g, condition)
     assert len(branches) == expected_count
@@ -73,12 +94,12 @@ def test_branches_survive_parent_deletion(init_cuda, builder, expected_count):
 
 @pytest.mark.parametrize("builder, expected_count", _COND_BUILDERS)
 def test_branches_usable_after_parent_deletion(init_cuda, builder, expected_count):
-    """Nodes can be added to branch graphs after parent GraphDef is deleted."""
+    """Nodes can be added to branch graphs after parent GraphDefinition is deleted."""
     mod = compile_common_kernels()
     kernel = mod.get_kernel("empty_kernel")
     config = LaunchConfig(grid=1, block=1)
 
-    g = GraphDef()
+    g = GraphDefinition()
     condition = try_create_condition(g)
     branches = builder(g, condition)
 
@@ -92,7 +113,7 @@ def test_branches_usable_after_parent_deletion(init_cuda, builder, expected_coun
 
 def test_reconstructed_body_survives_parent_deletion(init_cuda):
     """Body graph obtained via nodes() reconstruction survives parent deletion."""
-    g = GraphDef()
+    g = GraphDefinition()
     condition = try_create_condition(g)
     g.while_loop(condition)
 
@@ -117,16 +138,16 @@ def test_reconstructed_body_survives_parent_deletion(init_cuda):
 
 
 def test_child_graph_survives_parent_deletion(init_cuda):
-    """Embedded child graph remains valid after parent GraphDef is deleted."""
+    """Embedded child graph remains valid after parent GraphDefinition is deleted."""
     mod = compile_common_kernels()
     kernel = mod.get_kernel("empty_kernel")
     config = LaunchConfig(grid=1, block=1)
 
-    child_def = GraphDef()
+    child_def = GraphDefinition()
     child_def.launch(config, kernel)
     child_def.launch(config, kernel)
 
-    g = GraphDef()
+    g = GraphDefinition()
     node = g.embed(child_def)
     child_ref = node.child_graph
 
@@ -142,13 +163,13 @@ def test_nested_child_graph_lifetime(init_cuda):
     kernel = mod.get_kernel("empty_kernel")
     config = LaunchConfig(grid=1, block=1)
 
-    inner = GraphDef()
+    inner = GraphDefinition()
     inner.launch(config, kernel)
 
-    middle = GraphDef()
+    middle = GraphDefinition()
     middle.embed(inner)
 
-    outer = GraphDef()
+    outer = GraphDefinition()
     outer_node = outer.embed(middle)
 
     middle_ref = outer_node.child_graph
@@ -171,11 +192,11 @@ def test_event_record_node_keeps_event_alive(init_cuda):
     """EventRecordNode should keep the Event alive after original is deleted."""
     _skip_if_no_mempool()
     dev = Device()
-    g = GraphDef()
-    alloc = g.alloc(1024)
+    g = GraphDefinition()
+    alloc = g.allocate(1024)
 
-    event = dev.create_event(EventOptions(enable_timing=False))
-    node = alloc.record_event(event)
+    event = dev.create_event(EventOptions(timing_enabled=False))
+    node = alloc.record(event)
 
     del event
     gc.collect()
@@ -188,11 +209,11 @@ def test_event_wait_node_keeps_event_alive(init_cuda):
     """EventWaitNode should keep the Event alive after original is deleted."""
     _skip_if_no_mempool()
     dev = Device()
-    g = GraphDef()
-    alloc = g.alloc(1024)
+    g = GraphDefinition()
+    alloc = g.allocate(1024)
 
-    event = dev.create_event(EventOptions(enable_timing=False))
-    node = alloc.wait_event(event)
+    event = dev.create_event(EventOptions(timing_enabled=False))
+    node = alloc.wait(event)
 
     del event
     gc.collect()
@@ -204,14 +225,14 @@ def test_event_wait_node_keeps_event_alive(init_cuda):
 def test_event_record_node_preserves_metadata(init_cuda):
     """Reconstructed EventRecordNode recovers full Event metadata via reverse lookup."""
     dev = Device()
-    g = GraphDef()
+    g = GraphDefinition()
 
-    event = dev.create_event(EventOptions(enable_timing=True, busy_waited_sync=True))
-    node = g.record_event(event)
+    event = dev.create_event(EventOptions(timing_enabled=True, blocking_sync=True))
+    node = g.record(event)
 
     reconstructed = node.event
-    assert reconstructed.is_timing_disabled is False
-    assert reconstructed.is_sync_busy_waited is True
+    assert reconstructed.is_timing_enabled is True
+    assert reconstructed.is_blocking_sync is True
     assert reconstructed.is_ipc_enabled is False
     assert reconstructed.device is not None
 
@@ -219,42 +240,42 @@ def test_event_record_node_preserves_metadata(init_cuda):
 def test_event_wait_node_preserves_metadata(init_cuda):
     """Reconstructed EventWaitNode recovers full Event metadata via reverse lookup."""
     dev = Device()
-    g = GraphDef()
+    g = GraphDefinition()
 
-    event = dev.create_event(EventOptions(enable_timing=False))
-    node = g.wait_event(event)
+    event = dev.create_event(EventOptions(timing_enabled=False))
+    node = g.wait(event)
 
     reconstructed = node.event
-    assert reconstructed.is_timing_disabled is True
-    assert reconstructed.is_sync_busy_waited is False
+    assert reconstructed.is_timing_enabled is False
+    assert reconstructed.is_blocking_sync is False
     assert reconstructed.device is not None
 
 
 def test_event_metadata_survives_gc(init_cuda):
     """Event metadata is preserved through reverse lookup even after original is GC'd."""
     dev = Device()
-    g = GraphDef()
+    g = GraphDefinition()
 
-    event = dev.create_event(EventOptions(enable_timing=True, busy_waited_sync=True))
-    node = g.record_event(event)
+    event = dev.create_event(EventOptions(timing_enabled=True, blocking_sync=True))
+    node = g.record(event)
 
     del event
     gc.collect()
 
     retrieved = node.event
-    assert retrieved.is_timing_disabled is False
-    assert retrieved.is_sync_busy_waited is True
+    assert retrieved.is_timing_enabled is True
+    assert retrieved.is_blocking_sync is True
     assert retrieved.is_done is True
 
 
 def test_event_survives_graph_instantiation_and_execution(init_cuda):
     """Graph with event nodes executes correctly after original Event is deleted."""
     dev = Device()
-    g = GraphDef()
+    g = GraphDefinition()
 
-    event = dev.create_event(EventOptions(enable_timing=False))
-    rec = g.record_event(event)
-    rec.wait_event(event)
+    event = dev.create_event(EventOptions(timing_enabled=False))
+    rec = g.record(event)
+    rec.wait(event)
 
     del event
     gc.collect()
@@ -275,11 +296,11 @@ def test_event_survives_graph_clone_and_execution(init_cuda):
     from cuda.core._utils.cuda_utils import driver, handle_return
 
     dev = Device()
-    g = GraphDef()
+    g = GraphDefinition()
 
-    event = dev.create_event(EventOptions(enable_timing=False))
-    rec = g.record_event(event)
-    rec.wait_event(event)
+    event = dev.create_event(EventOptions(timing_enabled=False))
+    rec = g.record(event)
+    rec.wait(event)
 
     cloned_cu_graph = handle_return(driver.cuGraphClone(driver.CUgraph(g.handle)))
 
@@ -304,7 +325,7 @@ def test_python_callable_callback_survives_del(init_cuda):
     def my_callback():
         called[0] = True
 
-    g = GraphDef()
+    g = GraphDefinition()
     g.callback(my_callback)
 
     del my_callback
@@ -330,7 +351,7 @@ def test_cfunc_callback_survives_del(init_cuda):
     def raw_fn(data):
         called[0] = True
 
-    g = GraphDef()
+    g = GraphDefinition()
     g.callback(raw_fn)
 
     del raw_fn
@@ -357,7 +378,7 @@ def test_cfunc_bytes_user_data_survives_del(init_cuda):
         result[0] = ctypes.cast(data, ctypes.POINTER(ctypes.c_uint8))[0]
 
     payload = bytes([0xCD])
-    g = GraphDef()
+    g = GraphDefinition()
     g.callback(read_byte, user_data=payload)
 
     del payload
@@ -383,14 +404,14 @@ def test_kernel_node_keeps_kernel_alive(init_cuda):
     kernel = mod.get_kernel("empty_kernel")
     config = LaunchConfig(grid=1, block=1)
 
-    g = GraphDef()
+    g = GraphDefinition()
     node = g.launch(config, kernel)
 
     del kernel, mod
     gc.collect()
 
     retrieved = node.kernel
-    assert retrieved.attributes.max_threads_per_block() > 0
+    assert retrieved.attributes.max_threads_per_block > 0
 
 
 def test_kernel_survives_graph_instantiation_and_execution(init_cuda):
@@ -399,7 +420,7 @@ def test_kernel_survives_graph_instantiation_and_execution(init_cuda):
     kernel = mod.get_kernel("empty_kernel")
     config = LaunchConfig(grid=1, block=1)
 
-    g = GraphDef()
+    g = GraphDefinition()
     g.launch(config, kernel)
 
     del kernel, mod
@@ -424,7 +445,7 @@ def test_kernel_survives_graph_clone_and_execution(init_cuda):
     kernel = mod.get_kernel("empty_kernel")
     config = LaunchConfig(grid=1, block=1)
 
-    g = GraphDef()
+    g = GraphDefinition()
     g.launch(config, kernel)
 
     cloned_cu_graph = handle_return(driver.cuGraphClone(driver.CUgraph(g.handle)))
@@ -455,7 +476,7 @@ def test_kernel_from_handle_recovers_library(init_cuda):
     del kernel, mod
     gc.collect()
 
-    assert reconstructed.attributes.max_threads_per_block() > 0
+    assert reconstructed.attributes.max_threads_per_block > 0
 
 
 def test_kernel_node_reconstruction_preserves_validity(init_cuda):
@@ -465,11 +486,11 @@ def test_kernel_node_reconstruction_preserves_validity(init_cuda):
     kernel = mod.get_kernel("empty_kernel")
     config = LaunchConfig(grid=1, block=1)
 
-    g = GraphDef()
+    g = GraphDefinition()
     kernel_node = g.launch(config, kernel)
     # Chain a second node so we can reconstruct the kernel node via pred
     event = Device().create_event()
-    successor = kernel_node.record_event(event)
+    successor = kernel_node.record(event)
 
     del kernel, mod
     gc.collect()
@@ -479,9 +500,93 @@ def test_kernel_node_reconstruction_preserves_validity(init_cuda):
     # -> create_kernel_handle_ref -> handle recovery
     reconstructed = next(iter(successor.pred))
     assert isinstance(reconstructed, KernelNode)
-    assert reconstructed.kernel.attributes.max_threads_per_block() > 0
+    assert reconstructed.kernel.attributes.max_threads_per_block > 0
 
     graph = g.instantiate()
     stream = Device().create_stream()
     graph.launch(stream)
     stream.sync()
+
+
+# =============================================================================
+# Kernel argument lifetime — kernel nodes should keep argument objects alive
+# =============================================================================
+
+
+def test_kernel_args_buffer_lifetime(init_cuda):
+    """Buffer passed as a kernel arg is kept alive by the graph, the kernel
+    executes against its memory after the original Python ref drops, and the
+    Buffer is released once the graph is destroyed.
+
+    Without the user-object attachment, the ParamHolder is destroyed when the
+    kernel node is added, the Buffer is GC'd, and the graph is left with a
+    stale device pointer.
+
+    The final freeing assertion uses a bounded poll because CUgraphExec
+    releases its user-object references via an asynchronous DPC, and on
+    free-threaded Python the resulting Py_DECREF chain may need an extra
+    GC pass to settle.
+    """
+    from cuda.core._utils.cuda_utils import driver, handle_return
+
+    _skip_if_no_mempool()
+    dev = Device()
+    mr = DeviceMemoryResource(dev)
+    add_one = compile_common_kernels().get_kernel("add_one")
+    buf = mr.allocate(ctypes.sizeof(ctypes.c_int), stream=dev.default_stream)
+    buf.fill(0, stream=dev.default_stream)
+    dev.default_stream.sync()
+    buf_weak = weakref.ref(buf)
+    dptr = int(buf.handle)
+
+    g = GraphDefinition()
+    g.launch(LaunchConfig(grid=1, block=1), add_one, buf)
+
+    del buf
+    gc.collect()
+    assert buf_weak() is not None  # graph kept the Buffer alive
+
+    stream = dev.create_stream()
+    g.instantiate().launch(stream)
+    stream.sync()
+
+    out = (ctypes.c_int * 1)(0)
+    handle_return(driver.cuMemcpyDtoH(out, dptr, ctypes.sizeof(ctypes.c_int)))
+    assert out[0] == 1
+
+    del g
+    _wait_until(lambda: buf_weak() is None)
+
+
+def test_kernel_args_survive_graph_clone(init_cuda):
+    """Cloned graph keeps Buffer alive via CUDA user objects.
+
+    A graph clone does not inherit Python-level references, so only user
+    objects (which propagate through cuGraphClone) can keep the args alive.
+    """
+    from cuda.core._utils.cuda_utils import driver, handle_return
+
+    _skip_if_no_mempool()
+    dev = Device()
+    mr = DeviceMemoryResource(dev)
+    add_one = compile_common_kernels().get_kernel("add_one")
+    buf = mr.allocate(ctypes.sizeof(ctypes.c_int), stream=dev.default_stream)
+    buf.fill(0, stream=dev.default_stream)
+    dev.default_stream.sync()
+    dptr = int(buf.handle)
+
+    g = GraphDefinition()
+    g.launch(LaunchConfig(grid=1, block=1), add_one, buf)
+    cloned_cu_graph = handle_return(driver.cuGraphClone(driver.CUgraph(g.handle)))
+
+    del buf, g
+    gc.collect()
+
+    graph_exec = handle_return(driver.cuGraphInstantiate(cloned_cu_graph, 0))
+    stream = dev.create_stream()
+    handle_return(driver.cuGraphLaunch(graph_exec, driver.CUstream(int(stream.handle))))
+    stream.sync()
+
+    out = (ctypes.c_int * 1)(0)
+    handle_return(driver.cuMemcpyDtoH(out, dptr, ctypes.sizeof(ctypes.c_int)))
+    assert out[0] == 1
