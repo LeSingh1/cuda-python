@@ -41,10 +41,13 @@ GHA_GROUP = re.compile(r"##\[group\](.+)")
 GHA_LOG_LINE = re.compile(r"^[^\t]+\t([^\t]+)\t[^\t]+\t(.*)", re.DOTALL)
 
 # Map step-name substrings to canonical test suite names.
+# `gh api` logs contain the auto-generated "Run <command>" line (e.g. "Run
+# run-tests bindings") rather than the workflow's `name:` field, so match the
+# `run-tests <suite>` invocation.
 STEP_SUITE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
-    (re.compile(r"run cuda\.bindings tests", re.IGNORECASE), "cuda_bindings"),
-    (re.compile(r"run cuda\.core tests", re.IGNORECASE), "cuda_core"),
-    (re.compile(r"run cuda\.pathfinder tests", re.IGNORECASE), "cuda_pathfinder"),
+    (re.compile(r"\brun-tests bindings\b"), "cuda_bindings"),
+    (re.compile(r"\brun-tests core\b"), "cuda_core"),
+    (re.compile(r"\brun-tests pathfinder\b"), "cuda_pathfinder"),
 ]
 
 
@@ -272,7 +275,13 @@ def build_summary(results: list[ConfigResult]) -> str:
         for test_id, suite in result.test_suites.items():
             test_suites.setdefault(test_id, suite)
 
-    universal = sorted(intersection or set())
+    # Sort by (suite, test) so each suite groups together; tests with an
+    # unknown suite fall to the end.
+    def sort_key(test_id: str) -> tuple[bool, str, str]:
+        suite = test_suites.get(test_id, "")
+        return (not suite, suite, test_id)
+
+    universal = sorted(intersection or set(), key=sort_key)
     lines.append(f"Tests skipped across wheel test configurations ({len(results)}):")
     lines.append("")
     if not universal:
