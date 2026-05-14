@@ -40,7 +40,7 @@ def callableBinary(name):
     return shutil.which(name) is not None
 
 
-@pytest.mark.skipif(True, reason="Always skip!")
+@pytest.mark.skipif(True, reason="Always skipped test canary")
 def test_always_skip():
     pass
 
