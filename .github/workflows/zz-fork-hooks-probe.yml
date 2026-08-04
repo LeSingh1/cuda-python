@@ -1,0 +1,68 @@
+name: zz-fork-hooks-probe
+
+# Fork-only helper: runs the pure-Python build-backend tests on Linux so that
+# changes can be verified without CUDA hardware. Not intended for upstream.
+on:
+  push:
+    branches:
+      - "ci-probe"
+      - "probe/**"
+  workflow_dispatch:
+
+jobs:
+  build-hooks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ./cuda_pathfinder
+          python -m pip install "setuptools>=80" "Cython>=3.2.5,<3.3" \
+            "pytest==9.1.0" "pytest-mock==3.15.1" "pytest-randomly==4.1.0" \
+            "ruff==0.15.9"
+      - name: Show environment
+        run: python -c "import sys, platform; print(sys.version); print(platform.platform())"
+      - name: Run cuda_core build_hooks tests
+        run: |
+          python -m pytest cuda_core/tests/test_build_hooks.py \
+            -q -rs --no-header -p no:randomly --noconftest
+      - name: Byte-compile migrated modules
+        run: |
+          python -m py_compile \
+            cuda_core/build_hooks.py \
+            cuda_core/tests/helpers/__init__.py \
+            cuda_core/tests/example_tests/test_basic_examples.py \
+            cuda_core/examples/tma_tensor_map.py \
+            cuda_core/examples/thread_block_cluster.py \
+            cuda_bindings/build_hooks.py \
+            cuda_bindings/tests/test_cuda.py \
+            cuda_bindings/tests/test_cufile.py \
+            cuda_bindings/tests/test_examples.py
+      - name: Ruff (lint + format check) on migrated modules
+        run: |
+          python -m ruff check \
+            cuda_core/build_hooks.py \
+            cuda_core/tests/helpers/__init__.py \
+            cuda_core/tests/example_tests/test_basic_examples.py \
+            cuda_core/examples/tma_tensor_map.py \
+            cuda_core/examples/thread_block_cluster.py \
+            cuda_bindings/build_hooks.py \
+            cuda_bindings/tests/test_cuda.py \
+            cuda_bindings/tests/test_cufile.py \
+            cuda_bindings/tests/test_examples.py
+          python -m ruff format --check \
+            cuda_core/build_hooks.py \
+            cuda_core/tests/helpers/__init__.py \
+            cuda_core/tests/example_tests/test_basic_examples.py \
+            cuda_core/examples/tma_tensor_map.py \
+            cuda_core/examples/thread_block_cluster.py \
+            cuda_bindings/build_hooks.py \
+            cuda_bindings/tests/test_cuda.py \
+            cuda_bindings/tests/test_cufile.py \
+            cuda_bindings/tests/test_examples.py
+      - name: Extension/module discovery equivalence (cuda_core, cuda_bindings)
+        run: python probe_discovery_check.py
